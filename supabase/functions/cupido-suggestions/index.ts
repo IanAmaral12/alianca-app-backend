@@ -7,23 +7,8 @@ const corsHeaders = {
   'Content-Type': 'application/json',
 };
 
-const difficultyValues = ['easy', 'medium', 'hard'] as const;
-const frequencyValues = ['daily', 'weekly', 'monthly', 'one_time', 'custom_weekdays'] as const;
-const categoryValues = ['leisure', 'sport', 'commitment', 'children', 'routine', 'romantic_date'] as const;
-const weekdayValues = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'] as const;
-
-type TaskDifficulty = (typeof difficultyValues)[number];
-type TaskFrequency = (typeof frequencyValues)[number];
-type TaskCategory = (typeof categoryValues)[number];
-type Weekday = (typeof weekdayValues)[number];
-
 type Suggestion = {
-  category: TaskCategory;
-  custom_weekdays: Weekday[] | null;
   description: string | null;
-  difficulty: TaskDifficulty;
-  due_at: string | null;
-  frequency: TaskFrequency;
   title: string;
 };
 
@@ -52,33 +37,12 @@ function sanitizeSuggestion(rawSuggestion: RawSuggestion): Suggestion | null {
     return null;
   }
 
-  const rawDueAt = typeof rawSuggestion.due_at === 'string' ? rawSuggestion.due_at : null;
-  const dueAt = rawDueAt && !Number.isNaN(Date.parse(rawDueAt))
-    ? new Date(rawDueAt).toISOString()
-    : null;
-
-  const frequency = frequencyValues.includes(rawSuggestion.frequency as TaskFrequency)
-    ? rawSuggestion.frequency as TaskFrequency
-    : 'one_time';
-
-  const rawWeekdays = Array.isArray(rawSuggestion.custom_weekdays) ? rawSuggestion.custom_weekdays : [];
-  const customWeekdays = frequency === 'custom_weekdays'
-    ? Array.from(new Set(rawWeekdays.filter((weekday): weekday is Weekday =>
-      typeof weekday === 'string' && weekdayValues.includes(weekday as Weekday),
-    )))
-    : null;
-
   const description = typeof rawSuggestion.description === 'string'
     ? rawSuggestion.description.trim() || null
     : null;
 
   return {
-    category: categoryValues.includes(rawSuggestion.category as TaskCategory) ? rawSuggestion.category as TaskCategory : 'routine',
-    custom_weekdays: frequency === 'custom_weekdays' ? (customWeekdays.length > 0 ? customWeekdays : ['monday']) : null,
     description,
-    difficulty: difficultyValues.includes(rawSuggestion.difficulty as TaskDifficulty) ? rawSuggestion.difficulty as TaskDifficulty : 'easy',
-    due_at: dueAt,
-    frequency,
     title,
   };
 }
@@ -96,10 +60,9 @@ function buildSystemPrompt(jsonMode = false) {
     'Voce e o Cupido, um assistente de relacionamento para um app de casais.',
     'Gere exatamente 5 sugestoes de tarefas em portugues do Brasil, concretas, afetivas e realistas, usando apenas o contexto fornecido.',
     'Evite repetir tarefas ja frequentes no historico.',
-    'Use categorias e frequencias adequadas.',
-    'Quando frequency for custom_weekdays, informe custom_weekdays com pelo menos um dia.',
-    'Quando nao for custom_weekdays, informe custom_weekdays como null.',
-    'Use due_at em ISO 8601 apenas quando fizer sentido temporal claro; caso contrario, use null.',
+    'Cada sugestao deve conter apenas titulo e descricao.',
+    'Nao tente inferir categoria, frequencia, prazo ou dificuldade.',
+    'O foco e sugerir a ideia da tarefa com clareza e apelo emocional.',
     jsonMode
       ? 'Responda apenas com um objeto JSON valido com a chave suggestions.'
       : 'Responda apenas com JSON valido seguindo o schema.',
@@ -126,23 +89,8 @@ function buildJsonSchemaResponseFormat() {
               properties: {
                 title: { type: 'string' },
                 description: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-                difficulty: { type: 'string', enum: [...difficultyValues] },
-                frequency: { type: 'string', enum: [...frequencyValues] },
-                custom_weekdays: {
-                  anyOf: [
-                    {
-                      type: 'array',
-                      items: { type: 'string', enum: [...weekdayValues] },
-                      minItems: 1,
-                      uniqueItems: true,
-                    },
-                    { type: 'null' },
-                  ],
-                },
-                category: { type: 'string', enum: [...categoryValues] },
-                due_at: { anyOf: [{ type: 'string' }, { type: 'null' }] },
               },
-              required: ['title', 'description', 'difficulty', 'frequency', 'custom_weekdays', 'category', 'due_at'],
+              required: ['title', 'description'],
             },
           },
         },
@@ -207,50 +155,25 @@ function buildFallbackSuggestions(contextPayload: ContextPayload) {
 
   const fallbackSuggestions: Suggestion[] = [
     {
-      category: 'romantic_date',
-      custom_weekdays: null,
       description: `Reservem um momento sem telas para conversar sobre a semana, celebrar uma conquista e alinhar o que ${coupleLabel} querem viver nos proximos dias.`,
-      difficulty: 'easy',
-      due_at: null,
-      frequency: 'weekly',
       title: 'Encontro de alinhamento do casal',
     },
     {
-      category: 'routine',
-      custom_weekdays: ['monday', 'thursday'],
       description: 'Criem um checkpoint curto para revisar agenda, tarefas da casa e necessidades emocionais antes que a semana acelere.',
-      difficulty: 'easy',
-      due_at: null,
-      frequency: 'custom_weekdays',
       title: 'Checkpoint rapido da semana',
     },
     {
-      category: 'leisure',
-      custom_weekdays: null,
       description: 'Escolham uma experiencia leve para sair da rotina juntos, como um cafe diferente, filme tematico ou passeio ao ar livre.',
-      difficulty: 'medium',
-      due_at: null,
-      frequency: 'monthly',
       title: 'Programar um momento leve a dois',
     },
     {
-      category: hasChildren ? 'children' : 'commitment',
-      custom_weekdays: null,
       description: hasChildren
         ? 'Planejem uma atividade simples com os filhos que seja prazerosa para todos e reduza a sensacao de rotina automatica.'
         : 'Definam um pequeno compromisso concreto que melhore a organizacao da semana e alivie a carga mental do casal.',
-      difficulty: 'medium',
-      due_at: null,
-      frequency: 'one_time',
       title: hasChildren ? 'Criar um momento especial em familia' : 'Resolver um ponto pratico pendente',
     },
     {
-      category: 'sport',
-      custom_weekdays: null,
       description: 'Escolham uma atividade corporal simples para fazerem juntos, com foco em energia, humor e parceria, sem meta de performance.',
-      difficulty: 'hard',
-      due_at: null,
-      frequency: 'weekly',
       title: 'Movimento juntos para renovar a energia',
     },
   ];
