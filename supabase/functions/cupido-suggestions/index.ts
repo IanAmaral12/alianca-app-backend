@@ -27,6 +27,14 @@ type Suggestion = {
   title: string;
 };
 
+type ContextPayload = {
+  children: Array<Record<string, unknown>>;
+  members: Array<Record<string, unknown>>;
+  tasks: Array<Record<string, unknown>>;
+  today: string;
+  workspace: Record<string, unknown> | null;
+};
+
 function jsonResponse(status: number, body: Record<string, unknown>) {
   return new Response(JSON.stringify(body), { headers: corsHeaders, status });
 }
@@ -51,6 +59,208 @@ function sanitizeSuggestion(rawSuggestion: Suggestion): Suggestion {
     frequency: frequencyValues.includes(rawSuggestion.frequency) ? rawSuggestion.frequency : 'one_time',
     title: rawSuggestion.title.trim(),
   };
+}
+
+function safeJsonParse(value: string) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function buildSystemPrompt(jsonMode = false) {
+  return [
+    'Voce e o Cupido, um assistente de relacionamento para um app de casais.',
+    'Gere exatamente 5 sugestoes de tarefas em portugues do Brasil, concretas, afetivas e realistas, usando apenas o contexto fornecido.',
+    'Evite repetir tarefas ja frequentes no historico.',
+    'Use categorias e frequencias adequadas.',
+    'Quando frequency for custom_weekdays, informe custom_weekdays com pelo menos um dia.',
+    'Quando nao for custom_weekdays, informe custom_weekdays como null.',
+    'Use due_at em ISO 8601 apenas quando fizer sentido temporal claro; caso contrario, use null.',
+    jsonMode
+      ? 'Responda apenas com um objeto JSON valido com a chave suggestions.'
+      : 'Responda apenas com JSON valido seguindo o schema.',
+  ].join(' ');
+}
+
+function buildJsonSchemaResponseFormat() {
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: 'cupido_task_suggestions',
+      strict: true,
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          suggestions: {
+            type: 'array',
+            minItems: 5,
+            maxItems: 5,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                title: { type: 'string' },
+                description: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                difficulty: { type: 'string', enum: [...difficultyValues] },
+                frequency: { type: 'string', enum: [...frequencyValues] },
+                custom_weekdays: {
+                  anyOf: [
+                    {
+                      type: 'array',
+                      items: { type: 'string', enum: [...weekdayValues] },
+                      minItems: 1,
+                      uniqueItems: true,
+                    },
+                    { type: 'null' },
+                  ],
+                },
+                category: { type: 'string', enum: [...categoryValues] },
+                due_at: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+              },
+              required: ['title', 'description', 'difficulty', 'frequency', 'custom_weekdays', 'category', 'due_at'],
+            },
+          },
+        },
+        required: ['suggestions'],
+      },
+    },
+  };
+}
+
+async function requestGroqSuggestions(groqApiKey: string, contextPayload: ContextPayload, mode: 'strict' | 'json_object') {
+  const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${groqApiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'openai/gpt-oss-20b',
+      temperature: 0.7,
+      messages: [
+        {
+          role: 'system',
+          content: buildSystemPrompt(mode === 'json_object'),
+        },
+        {
+          role: 'user',
+          content: JSON.stringify(contextPayload),
+        },
+      ],
+      response_format: mode === 'strict' ? buildJsonSchemaResponseFormat() : { type: 'json_object' },
+    }),
+  });
+
+  const responseText = await groqResponse.text();
+
+  if (!groqResponse.ok) {
+    throw new Error(`Groq ${mode} failed: ${responseText}`);
+  }
+
+  const groqPayload = safeJsonParse(responseText);
+  const rawContent = groqPayload?.choices?.[0]?.message?.content;
+
+  if (typeof rawContent !== 'string') {
+    throw new Error(`Groq ${mode} returned empty content.`);
+  }
+
+  const parsedContent = safeJsonParse(rawContent);
+
+  if (!parsedContent || !Array.isArray(parsedContent.suggestions)) {
+    throw new Error(`Groq ${mode} returned invalid suggestion payload.`);
+  }
+
+  return parsedContent.suggestions as Suggestion[];
+}
+
+function buildFallbackSuggestions(contextPayload: ContextPayload) {
+  const memberNames = contextPayload.members
+    .map((member) => typeof member.full_name === 'string' ? member.full_name.trim() : '')
+    .filter(Boolean);
+  const coupleLabel = memberNames.length > 0 ? memberNames.join(' e ') : 'voces dois';
+  const hasChildren = contextPayload.children.length > 0;
+
+  const fallbackSuggestions: Suggestion[] = [
+    {
+      category: 'romantic_date',
+      custom_weekdays: null,
+      description: `Reservem um momento sem telas para conversar sobre a semana, celebrar uma conquista e alinhar o que ${coupleLabel} querem viver nos proximos dias.`,
+      difficulty: 'easy',
+      due_at: null,
+      frequency: 'weekly',
+      title: 'Encontro de alinhamento do casal',
+    },
+    {
+      category: 'routine',
+      custom_weekdays: ['monday', 'thursday'],
+      description: 'Criem um checkpoint curto para revisar agenda, tarefas da casa e necessidades emocionais antes que a semana acelere.',
+      difficulty: 'easy',
+      due_at: null,
+      frequency: 'custom_weekdays',
+      title: 'Checkpoint rapido da semana',
+    },
+    {
+      category: 'leisure',
+      custom_weekdays: null,
+      description: 'Escolham uma experiencia leve para sair da rotina juntos, como um cafe diferente, filme tematico ou passeio ao ar livre.',
+      difficulty: 'medium',
+      due_at: null,
+      frequency: 'monthly',
+      title: 'Programar um momento leve a dois',
+    },
+    {
+      category: hasChildren ? 'children' : 'commitment',
+      custom_weekdays: null,
+      description: hasChildren
+        ? 'Planejem uma atividade simples com os filhos que seja prazerosa para todos e reduza a sensacao de rotina automatica.'
+        : 'Definam um pequeno compromisso concreto que melhore a organizacao da semana e alivie a carga mental do casal.',
+      difficulty: 'medium',
+      due_at: null,
+      frequency: 'one_time',
+      title: hasChildren ? 'Criar um momento especial em familia' : 'Resolver um ponto pratico pendente',
+    },
+    {
+      category: 'sport',
+      custom_weekdays: null,
+      description: 'Escolham uma atividade corporal simples para fazerem juntos, com foco em energia, humor e parceria, sem meta de performance.',
+      difficulty: 'hard',
+      due_at: null,
+      frequency: 'weekly',
+      title: 'Movimento juntos para renovar a energia',
+    },
+  ];
+
+  return fallbackSuggestions;
+}
+
+function finalizeSuggestions(rawSuggestions: Suggestion[], contextPayload: ContextPayload) {
+  const normalized = rawSuggestions
+    .map(sanitizeSuggestion)
+    .filter((suggestion) => suggestion.title)
+    .slice(0, 5);
+
+  if (normalized.length === 5) {
+    return normalized;
+  }
+
+  const fallbackSuggestions = buildFallbackSuggestions(contextPayload);
+  const existingTitles = new Set(normalized.map((suggestion) => suggestion.title.toLowerCase()));
+
+  for (const fallbackSuggestion of fallbackSuggestions) {
+    if (normalized.length >= 5) {
+      break;
+    }
+
+    if (!existingTitles.has(fallbackSuggestion.title.toLowerCase())) {
+      normalized.push(fallbackSuggestion);
+      existingTitles.add(fallbackSuggestion.title.toLowerCase());
+    }
+  }
+
+  return normalized.slice(0, 5);
 }
 
 Deno.serve(async (request) => {
@@ -184,7 +394,7 @@ Deno.serve(async (request) => {
     questionnaire: questionnaireByUserId.get(profile.id) ?? null,
   }));
 
-  const contextPayload = {
+  const contextPayload: ContextPayload = {
     children: childrenResult.data ?? [],
     members,
     tasks: tasksResult.data ?? [],
@@ -192,99 +402,33 @@ Deno.serve(async (request) => {
     workspace: workspaceResult.data,
   };
 
-  const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${groqApiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'openai/gpt-oss-20b',
-      temperature: 0.7,
-      messages: [
-        {
-          role: 'system',
-          content:
-            'Voce e o Cupido, um assistente de relacionamento para um app de casais. Gere exatamente 5 sugestoes de tarefas em portugues do Brasil, concretas, afetivas e realistas, usando apenas o contexto fornecido. Evite repetir tarefas ja frequentes no historico. Use categorias e frequencias adequadas. Quando frequency for custom_weekdays, informe custom_weekdays com pelo menos um dia. Quando nao for custom_weekdays, informe custom_weekdays como null. Use due_at em ISO 8601 apenas quando fizer sentido temporal claro; caso contrario, use null. Responda apenas com JSON valido seguindo o schema.',
-        },
-        {
-          role: 'user',
-          content: JSON.stringify(contextPayload),
-        },
-      ],
-      response_format: {
-        type: 'json_schema',
-        json_schema: {
-          name: 'cupido_task_suggestions',
-          strict: true,
-          schema: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              suggestions: {
-                type: 'array',
-                minItems: 5,
-                maxItems: 5,
-                items: {
-                  type: 'object',
-                  additionalProperties: false,
-                  properties: {
-                    title: { type: 'string' },
-                    description: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-                    difficulty: { type: 'string', enum: [...difficultyValues] },
-                    frequency: { type: 'string', enum: [...frequencyValues] },
-                    custom_weekdays: {
-                      anyOf: [
-                        {
-                          type: 'array',
-                          items: { type: 'string', enum: [...weekdayValues] },
-                          minItems: 1,
-                          uniqueItems: true,
-                        },
-                        { type: 'null' },
-                      ],
-                    },
-                    category: { type: 'string', enum: [...categoryValues] },
-                    due_at: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-                  },
-                  required: ['title', 'description', 'difficulty', 'frequency', 'custom_weekdays', 'category', 'due_at'],
-                },
-              },
-            },
-            required: ['suggestions'],
-          },
-        },
-      },
-    }),
-  });
-
-  if (!groqResponse.ok) {
-    const groqErrorText = await groqResponse.text();
-    return jsonResponse(502, { error: `Groq request failed: ${groqErrorText}` });
-  }
-
-  const groqPayload = await groqResponse.json();
-  const rawContent = groqPayload?.choices?.[0]?.message?.content;
-
-  if (typeof rawContent !== 'string') {
-    return jsonResponse(502, { error: 'Groq returned an empty response.' });
-  }
-
-  let parsedContent: { suggestions: Suggestion[] };
+  let rawSuggestions: Suggestion[] = [];
+  let provider = 'groq-strict';
+  let warning: string | null = null;
 
   try {
-    parsedContent = JSON.parse(rawContent);
-  } catch {
-    return jsonResponse(502, { error: 'Groq returned invalid JSON.' });
+    rawSuggestions = await requestGroqSuggestions(groqApiKey, contextPayload, 'strict');
+  } catch (strictError) {
+    console.error('Cupido strict mode failed', strictError);
+
+    try {
+      rawSuggestions = await requestGroqSuggestions(groqApiKey, contextPayload, 'json_object');
+      provider = 'groq-json-object';
+      warning = 'Structured output strict falhou; usando fallback JSON.';
+    } catch (jsonModeError) {
+      console.error('Cupido json_object mode failed', jsonModeError);
+      rawSuggestions = buildFallbackSuggestions(contextPayload);
+      provider = 'fallback';
+      warning = 'Groq indisponivel ou respondeu fora do esperado; usando sugestoes de fallback.';
+    }
   }
 
-  const suggestions = (parsedContent.suggestions ?? [])
-    .map(sanitizeSuggestion)
-    .filter((suggestion) => suggestion.title);
+  const suggestions = finalizeSuggestions(rawSuggestions, contextPayload);
 
   if (suggestions.length !== 5) {
-    return jsonResponse(502, { error: 'Groq did not return exactly 5 valid suggestions.' });
+    console.error('Cupido could not assemble 5 suggestions', { suggestionsLength: suggestions.length });
+    return jsonResponse(500, { error: 'Nao foi possivel montar sugestoes suficientes.' });
   }
 
-  return jsonResponse(200, { suggestions });
+  return jsonResponse(200, { provider, suggestions, warning });
 });
